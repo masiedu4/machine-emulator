@@ -66,6 +66,13 @@ where options are:
   --no-remote-destroy
     do not destroy the cartesi machine in the remote server after the execution.
 
+  --no-rollback
+    disable rollback for advance and inspect states.
+    this allows to perform advance and inspect states on local cartesi machines,
+    however the state is never reverted, even in case inspects or rejected advances.
+
+    DON'T USE THIS OPTION IN PRODUCTION
+
   --ram-image=<filename>
     name of file containing RAM image (default: "linux.bin").
 
@@ -436,6 +443,7 @@ local checkin_address
 local remote_shutdown = false
 local remote_create = true
 local remote_destroy = true
+local perform_rollbacks = true
 local images_path = adjust_images_path(os.getenv("CARTESI_IMAGES_PATH"))
 local flash_image_filename = { root = images_path .. "rootfs.ext2" }
 local flash_label_order = { "root" }
@@ -865,6 +873,14 @@ local options = {
         function(all)
             if not all then return false end
             skip_version_check = true
+            return true
+        end,
+    },
+    {
+        "^%-%-no%-rollback$",
+        function(o)
+            if not o then return false end
+            perform_rollbacks = false
             return true
         end,
     },
@@ -1815,14 +1831,13 @@ if store_config == stderr then store_machine_config(config, stderr) end
 if rollup_advance or rollup_inspect then
     check_rollup_htif_config(config.htif)
     assert(config.rollup, "rollup device must be present")
-    assert(remote_address, "rollup requires --remote-address for snapshot/rollback")
+    assert(remote_address or not perform_rollbacks, "rollup requires --remote-address for snapshot/rollback")
     check_rollup_memory_range_config(config.rollup.tx_buffer, "tx-buffer")
     check_rollup_memory_range_config(config.rollup.rx_buffer, "rx-buffer")
     check_rollup_memory_range_config(config.rollup.input_metadata, "input-metadata")
     check_rollup_memory_range_config(config.rollup.voucher_hashes, "voucher-hashes")
     check_rollup_memory_range_config(config.rollup.notice_hashes, "notice-hashes")
 end
-local cycles = machine:read_mcycle()
 if initial_hash then
     assert(not config.htif.console_getchar, "hashes are meaningless in interactive mode")
     print_root_hash(machine, stderr_unsilenceable)
@@ -1847,14 +1862,13 @@ end
 -- once all inputs for advance state have been consumed, we check if the user selected rollup inspect state
 -- if so, we feed the query, reset iflags_Y, and resume the machine
 -- the machine can now continue processing and may yield automatic to produce reports we save
-while math.ult(cycles, max_mcycle) do
+while math.ult(machine:read_mcycle(), max_mcycle) do
     local next_mcycle = math.min(next_hash_mcycle, max_mcycle)
     if gdb_stub and gdb_stub:is_connected() then
         gdb_stub:run(next_mcycle)
     else
         machine:run(next_mcycle)
     end
-    cycles = machine:read_mcycle()
     -- deal with halt
     if machine:read_iflags_H() then
         exit_code = machine:read_htif_tohost_data() >> 1
@@ -1863,7 +1877,7 @@ while math.ult(cycles, max_mcycle) do
         else
             stderr("\nHalted\n")
         end
-        stderr("Cycles: %u\n", cycles)
+        stderr("Cycles: %u\n", machine:read_mcycle())
         break
     -- deal with yield manual
     elseif machine:read_iflags_Y() then
@@ -1878,14 +1892,13 @@ while math.ult(cycles, max_mcycle) do
                 save_rollup_voucher_and_notice_hashes(machine, config.rollup, rollup_advance)
             end
             if reason == cartesi.machine.HTIF_YIELD_REASON_RX_REJECTED then
-                machine:rollback()
-                cycles = machine:read_mcycle()
+                if perform_rollbacks then machine:rollback() end
             else
                 assert(reason == cartesi.machine.HTIF_YIELD_REASON_RX_ACCEPTED, "invalid manual yield reason")
             end
             stderr("\nEpoch %d before input %d\n", rollup_advance.epoch_index, rollup_advance.next_input_index)
             if rollup_advance.hashes then print_root_hash(machine) end
-            machine:snapshot()
+            if perform_rollbacks then machine:snapshot() end
             load_rollup_input_and_metadata(machine, config.rollup, rollup_advance)
             if rollup_advance.hashes then print_root_hash(machine) end
             machine:reset_iflags_Y()
@@ -1900,8 +1913,7 @@ while math.ult(cycles, max_mcycle) do
                 if reason == cartesi.machine.HTIF_YIELD_REASON_RX_ACCEPTED then
                     save_rollup_voucher_and_notice_hashes(machine, config.rollup, rollup_advance)
                 elseif reason == cartesi.machine.HTIF_YIELD_REASON_RX_REJECTED then
-                    machine:rollback()
-                    cycles = machine:read_mcycle()
+                    if perform_rollbacks then machine:rollback() end
                 end
                 rollup_advance = nil
             end
@@ -1943,7 +1955,7 @@ while math.ult(cycles, max_mcycle) do
         -- otherwise ignore
     end
     if machine:read_iflags_Y() then break end
-    if cycles == next_hash_mcycle then
+    if machine:read_mcycle() == next_hash_mcycle then
         print_root_hash(machine)
         next_hash_mcycle = next_hash_mcycle + periodic_hashes_period
     end
