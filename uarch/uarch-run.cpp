@@ -18,30 +18,21 @@
 
 #include "compiler-defines.h"
 #include "interpret.h"
+#include "machine-uarch-bridge-state-access.h"
 #include "uarch-constants.h"
-#include "uarch-machine-state-access.h"
+#include "uarch-ecall.h"
 
 #include <cstdint>
 
 using namespace cartesi;
 
-static void set_uarch_halt_flag() {
-    // NOLINTNEXTLINE(hicpp-no-assembler)
-    asm volatile("mv a7, %0\n"
-                 "ecall\n"
-                 : // no output
-                 : "r"(cartesi::uarch_ecall_functions::UARCH_ECALL_FN_HALT)
-                 : "a7" // modified registers
-    );
-}
-
 // Let the state accessor be on static memory storage to speed up uarch initialization
-static uarch_machine_state_access a; // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+static machine_uarch_bridge_state_access a; // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 
 namespace cartesi {
 
 // Declaration of explicit instantiation in module interpret.cpp when compiled with microarchitecture
-extern template interpreter_break_reason interpret(uarch_machine_state_access &a, uint64_t mcycle_end);
+extern template interpreter_break_reason interpret(machine_uarch_bridge_state_access &a, uint64_t mcycle_end);
 
 } // namespace cartesi
 
@@ -51,7 +42,7 @@ extern "C" NO_RETURN void interpret_next_mcycle_with_uarch() {
     const uint64_t mcycle_end = a.read_mcycle() + 1;
     interpret(a, mcycle_end);
     // Finished executing a whole mcycle: halt the microarchitecture
-    set_uarch_halt_flag();
+    ua_halt_ECALL();
     // The micro interpreter will never execute this line because the micro machine is halted
     __builtin_trap();
 }

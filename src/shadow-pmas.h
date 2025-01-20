@@ -40,27 +40,52 @@ struct PACKED shadow_pmas_state {
     shadow_pma_entry pmas[PMA_MAX];
 };
 
-/// \brief Obtains the relative address of a PMA entry in shadow memory.
-/// \param p Index of desired shadow PMA entry, in 0..31.
+/// \brief List of field types
+enum class shadow_pmas_what : uint64_t {
+    istart = offsetof(shadow_pma_entry, istart),
+    ilength = offsetof(shadow_pma_entry, ilength),
+    unknown_
+};
+
+/// \brief Obtains the absolute address of a PMA entry in shadow memory.
+/// \param p Index of desired shadow PMA entry
 /// \returns The address.
-static inline uint64_t shadow_pmas_get_pma_rel_addr(uint64_t p) {
-    assert(p < (int) PMA_MAX);
-    return p * sizeof(shadow_pma_entry);
+static constexpr uint64_t shadow_pmas_get_pma_abs_addr(uint64_t p) {
+    return PMA_SHADOW_PMAS_START + p * sizeof(shadow_pma_entry);
 }
 
 /// \brief Obtains the absolute address of a PMA entry in shadow memory.
-static inline uint64_t shadow_pmas_get_pma_abs_addr(uint64_t p) {
-    return PMA_SHADOW_PMAS_START + shadow_pmas_get_pma_rel_addr(p);
+/// \param p Index of desired shadow PMA entry
+/// \param what Desired field
+/// \returns The address.
+static constexpr uint64_t shadow_pmas_get_pma_abs_addr(uint64_t p, shadow_pmas_what what) {
+    return shadow_pmas_get_pma_abs_addr(p) + static_cast<uint64_t>(what);
 }
 
-/// \brief Obtains the absolute address of the istart field in a PMA entry in shadow memory.
-static inline uint64_t shadow_pmas_get_pma_istart_abs_addr(uint64_t p) {
-    return shadow_pmas_get_pma_abs_addr(p) + offsetof(shadow_pma_entry, istart);
+static constexpr shadow_pmas_what shadow_pmas_get_what(uint64_t paddr) {
+    if (paddr < PMA_SHADOW_PMAS_START || paddr - PMA_SHADOW_PMAS_START >= sizeof(shadow_pmas_state) ||
+        (paddr & (sizeof(uint64_t) - 1)) != 0) {
+        return shadow_pmas_what::unknown_;
+    }
+    paddr -= PMA_SHADOW_PMAS_START;
+    return shadow_pmas_what{paddr % sizeof(shadow_pma_entry)};
 }
 
-/// \brief Obtains the absolute address of the ilength field in a PMA entry in shadow memory.
-static inline uint64_t shadow_pmas_get_pma_ilength_abs_addr(uint64_t p) {
-    return shadow_pmas_get_pma_abs_addr(p) + offsetof(shadow_pma_entry, ilength);
+static constexpr const char *shadow_pmas_get_what_name(shadow_pmas_what what) {
+    const auto paddr = static_cast<uint64_t>(what);
+    if (paddr < PMA_SHADOW_PMAS_START || paddr - PMA_SHADOW_PMAS_START >= sizeof(shadow_pmas_state) ||
+        (paddr & (sizeof(uint64_t) - 1)) != 0) {
+        return "pma.unknown";
+    }
+    using reg = shadow_pmas_what;
+    switch (what) {
+        case reg::istart:
+            return "pma.istart";
+        case reg::ilength:
+            return "pma.ilength";
+        case reg::unknown_:
+            return "pma.unknown";
+    }
 }
 
 } // namespace cartesi

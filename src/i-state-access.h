@@ -610,6 +610,14 @@ public:
         return derived().do_read_pma_entry(index);
     }
 
+    /// \brief Converts a target physical address to the implementation-defined fast address
+    /// \param paddr Target physical address to convert
+    /// \param pma_index Index of PMA where address falls
+    /// \returns Corresponding implementation-defined fast address
+    fast_addr get_faddr(uint64_t paddr, uint64_t pma_index) const {
+        return derived().do_get_faddr(paddr, pma_index);
+    }
+
     /// \brief Reads a chunk of data from a memory PMA range.
     /// \param paddr Target physical address.
     /// \param data Receives chunk of memory.
@@ -674,27 +682,27 @@ public:
     /// \tparam USE TLB set
     /// \param slot_index Slot index
     /// \returns Value in slot.
-    template <TLB_set_use USE>
+    template <TLB_set_index SET>
     uint64_t read_tlb_vaddr_page(uint64_t slot_index) {
-        return derived().template do_read_tlb_vaddr_page<USE>(slot_index);
+        return derived().template do_read_tlb_vaddr_page<SET>(slot_index);
     }
 
     /// \brief Reads TLB's vp_offset
     /// \tparam USE TLB set
     /// \param slot_index Slot index
     /// \returns Value in slot.
-    template <TLB_set_use USE>
+    template <TLB_set_index SET>
     fast_addr read_tlb_vp_offset(uint64_t slot_index) {
-        return derived().template do_read_tlb_vp_offset<USE>(slot_index);
+        return derived().template do_read_tlb_vp_offset<SET>(slot_index);
     }
 
     /// \brief Reads TLB's pma_index
     /// \tparam USE TLB set
     /// \param slot_index Slot index
     /// \returns Value in slot.
-    template <TLB_set_use USE>
+    template <TLB_set_index SET>
     uint64_t read_tlb_pma_index(uint64_t slot_index) {
-        return derived().template do_read_tlb_pma_index<USE>(slot_index);
+        return derived().template do_read_tlb_pma_index<SET>(slot_index);
     }
 
     /// \brief Writes to a TLB slot
@@ -705,17 +713,9 @@ public:
     /// \param pma_index Value to write
     /// \detail Writes to the TLB must be modify all fields atomically to prevent an inconsistent state.
     /// This simplifies all state access implementations.
-    template <TLB_set_use USE>
+    template <TLB_set_index SET>
     void write_tlb(uint64_t slot_index, uint64_t vaddr_page, fast_addr vp_offset, uint64_t pma_index) {
-        return derived().template do_write_tlb<USE>(slot_index, vaddr_page, vp_offset, pma_index);
-    }
-
-    /// \brief Converts a target physical address to the implementation-defined fast address
-    /// \param paddr Target physical address to convert
-    /// \param pma_index Index of PMA where address falls
-    /// \returns Correspnding implementation-defined fast address
-    fast_addr get_faddr(uint64_t paddr, uint64_t pma_index) const {
-        return derived().do_get_faddr(paddr, pma_index);
+        return derived().template do_write_tlb<SET>(slot_index, vaddr_page, vp_offset, pma_index);
     }
 
     /// \brief Marks a page as dirty
@@ -737,7 +737,7 @@ public:
     }
 
     // ---
-    // These methods ONLY need to be implemented when state belongs to non-reproducible host machine
+    // These methods ONLY need to be implemented when state belongs to non-reproducible host machines
     // ---
 
     /// \brief Poll for external interrupts.
@@ -771,7 +771,6 @@ public:
 #endif
 
 protected:
-
     /// \brief Default implementation when state does not belong to non-reproducible host machine
     bool do_get_soft_yield() { // NOLINT(readability-convert-member-functions-to-static)
         return false;
@@ -787,7 +786,6 @@ protected:
     int do_getchar() { // NOLINT(readability-convert-member-functions-to-static)
         return -1;
     }
-
 };
 
 /// \brief SFINAE test implementation of the i_state_access interface

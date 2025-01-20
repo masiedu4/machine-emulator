@@ -21,10 +21,8 @@
 #include <utility>
 
 #ifdef MICROARCHITECTURE
-#ifdef OKUARCH
-#include "uarch-machine-state-access.h"
+#include "machine-uarch-bridge-state-access.h"
 #include "uarch-runtime.h"
-#endif
 #else
 #include "record-step-state-access.h"
 #include "replay-step-state-access.h"
@@ -814,14 +812,14 @@ static FORCE_INLINE int32_t insn_get_C_SWSP_imm(uint32_t insn) {
 /// \tparam STATE_ACCESS Class of machine state accessor object.
 /// \param a Machine state accessor object.
 /// \param slot_index Slot index
-template <TLB_set_use USE, typename STATE_ACCESS>
+template <TLB_set_index SET, typename STATE_ACCESS>
 static void flush_tlb_slot(STATE_ACCESS &a, uint64_t slot_index) {
     // Make sure a valid page leaving the write TLB is marked as dirty
     // We must do this BEFORE we modify the TLB entries themselves
     // (Otherwise, we could stop uarch before it marks the page dirty but after
     // the entry is no longer in the TLB, which would cause the Merkle tree to
     // miss a dirty page.)
-    if constexpr (USE == TLB_WRITE) {
+    if constexpr (SET == TLB_WRITE) {
         const auto old_vaddr_page = a.template read_tlb_vaddr_page<TLB_WRITE>(slot_index);
         if (old_vaddr_page != TLB_INVALID_PAGE) {
             auto old_pma_index = a.template read_tlb_pma_index<TLB_WRITE>(slot_index);
@@ -834,17 +832,17 @@ static void flush_tlb_slot(STATE_ACCESS &a, uint64_t slot_index) {
     const auto vaddr_page = TLB_INVALID_PAGE;
     const auto vp_offset = i_state_access_fast_addr_t<STATE_ACCESS>{};
     const auto pma_index = TLB_INVALID_PMA_INDEX;
-    a.template write_tlb<USE>(slot_index, vaddr_page, vp_offset, pma_index);
+    a.template write_tlb<SET>(slot_index, vaddr_page, vp_offset, pma_index);
 }
 
 /// \brief Flushes out an entire TLB set
 /// \tparam USE TLB set
 /// \tparam STATE_ACCESS Class of machine state accessor object.
 /// \param a Machine state accessor object.
-template <TLB_set_use USE, typename STATE_ACCESS>
+template <TLB_set_index SET, typename STATE_ACCESS>
 static void flush_tlb_set(STATE_ACCESS &a) {
     for (uint64_t slot_index = 0; slot_index < PMA_TLB_SIZE; ++slot_index) {
-        flush_tlb_slot<USE>(a, slot_index);
+        flush_tlb_slot<SET>(a, slot_index);
     }
 }
 
@@ -881,15 +879,15 @@ static void flush_tlb_vaddr(STATE_ACCESS &a, uint64_t /* vaddr */) {
 /// \param paddr Index of PMA where paddr falls
 /// \param vp_offset Receives the new vp_offset that will be stored in the slot
 /// \returns The implementation-defined fast address corresponding to paddr
-template <TLB_set_use USE, typename STATE_ACCESS>
+template <TLB_set_index SET, typename STATE_ACCESS>
 static i_state_access_fast_addr_t<STATE_ACCESS> replace_tlb_entry(STATE_ACCESS &a, uint64_t vaddr, uint64_t paddr,
     uint64_t pma_index, i_state_access_fast_addr_t<STATE_ACCESS> &vp_offset) {
     const auto slot_index = tlb_slot_index(vaddr);
-    flush_tlb_slot<USE>(a, slot_index);
+    flush_tlb_slot<SET>(a, slot_index);
     const auto vaddr_page = tlb_addr_page(vaddr);
     const auto faddr = a.get_faddr(paddr, pma_index);
     vp_offset = faddr - vaddr;
-    a.template write_tlb<USE>(slot_index, vaddr_page, vp_offset, pma_index);
+    a.template write_tlb<SET>(slot_index, vaddr_page, vp_offset, pma_index);
     return faddr;
 }
 
@@ -901,10 +899,10 @@ static i_state_access_fast_addr_t<STATE_ACCESS> replace_tlb_entry(STATE_ACCESS &
 /// \param paddr Corresponding physical address
 /// \param paddr Index of PMA where paddr falls
 /// \returns The implementation-defined fast address corresponding to paddr
-template <TLB_set_use USE, typename STATE_ACCESS>
+template <TLB_set_index SET, typename STATE_ACCESS>
 static FORCE_INLINE auto replace_tlb_entry(STATE_ACCESS &a, uint64_t vaddr, uint64_t paddr, uint64_t pma_index) {
     i_state_access_fast_addr_t<STATE_ACCESS> vp_offset{0};
-    return replace_tlb_entry<USE>(a, vaddr, paddr, pma_index, vp_offset);
+    return replace_tlb_entry<SET>(a, vaddr, paddr, pma_index, vp_offset);
 }
 
 /// \brief Read an aligned word from virtual memory (slow path that goes through virtual address translation).
@@ -1068,8 +1066,8 @@ static FORCE_INLINE execute_status write_virtual_memory(STATE_ACCESS &a, uint64_
         pc = new_pc;
         return status;
     }
-    const auto pma_index = a.template read_tlb_pma_index<TLB_READ>(slot_index);
-    const auto vp_offset = a.template read_tlb_vp_offset<TLB_READ>(slot_index);
+    const auto pma_index = a.template read_tlb_pma_index<TLB_WRITE>(slot_index);
+    const auto vp_offset = a.template read_tlb_vp_offset<TLB_WRITE>(slot_index);
     const auto faddr = vaddr + vp_offset;
     a.template write_memory_word<T>(faddr, pma_index, static_cast<T>(val64));
     INC_COUNTER(a.get_statistics(), tlb_whit);
@@ -5770,10 +5768,8 @@ interpreter_break_reason interpret(STATE_ACCESS &a, uint64_t mcycle_end) {
 }
 
 #ifdef MICROARCHITECTURE
-#ifdef OKUARCH
-// Explicit instantiation for uarch_machine_state_access
-template interpreter_break_reason interpret(uarch_machine_state_access &a, uint64_t mcycle_end);
-#endif
+// Explicit instantiation for machine_uarch_bridge_state_access
+template interpreter_break_reason interpret(machine_uarch_bridge_state_access &a, uint64_t mcycle_end);
 #else
 // Explicit instantiation for state_access
 template interpreter_break_reason interpret(state_access &a, uint64_t mcycle_end);

@@ -59,20 +59,22 @@
 #include "shadow-state.h"
 #include "shadow-tlb-factory.h"
 #include "shadow-tlb.h"
+#include "shadow-uarch-state-factory.h"
 #include "shadow-uarch-state.h"
 #include "state-access.h"
 #include "strict-aliasing.h"
 #include "tlb.h"
 #include "translate-virtual-address.h"
-#include "uarch-pristine-state-hash.h"
-#ifdef OKUARCH
+#include "uarch-config.h"
+#include "uarch-constants.h"
 #include "uarch-interpret.h"
+#include "uarch-pristine-state-hash.h"
+#include "uarch-pristine.h"
 #include "uarch-record-state-access.h"
 #include "uarch-replay-state-access.h"
 #include "uarch-reset-state.h"
 #include "uarch-state-access.h"
 #include "uarch-step.h"
-#endif
 #include "unique-c-ptr.h"
 #include "virtio-console.h"
 #include "virtio-device.h"
@@ -135,6 +137,15 @@ const pma_entry::flags machine::m_cmio_tx_buffer_flags{
     true,                          // IR
     true,                          // IW
     PMA_ISTART_DID::cmio_tx_buffer // DID
+};
+
+const pma_entry::flags ram_flags{
+    true,                  // R
+    true,                  // W
+    true,                  // X
+    true,                  // IR
+    true,                  // IW
+    PMA_ISTART_DID::memory // DID
 };
 
 pma_entry machine::make_memory_range_pma_entry(const std::string &description, const memory_range_config &c) {
@@ -209,6 +220,7 @@ pma_entry &machine::register_pma_entry(pma_entry &&pma) {
 
 static bool DID_is_protected(PMA_ISTART_DID DID) {
     switch (DID) {
+        case PMA_ISTART_DID::memory:
         case PMA_ISTART_DID::flash_drive:
         case PMA_ISTART_DID::cmio_rx_buffer:
         case PMA_ISTART_DID::cmio_tx_buffer:
@@ -234,72 +246,55 @@ void machine::replace_memory_range(const memory_range_config &range) {
 }
 
 void machine::init_tlb() {
-    for (auto use : {TLB_CODE, TLB_READ, TLB_WRITE}) {
-        auto &hot_set = m_s.tlb.hot[use];
-        auto &cold_set = m_s.tlb.cold[use];
+    for (auto set_index : {TLB_CODE, TLB_READ, TLB_WRITE}) {
         for (uint64_t slot_index = 0; slot_index < TLB_SET_SIZE; ++slot_index) {
-            auto &hot_slot = hot_set[slot_index];
-            hot_slot.vaddr_page = TLB_INVALID_PAGE;
-            hot_slot.vh_offset = host_addr{};
-            auto &cold_slot = cold_set[slot_index];
-            cold_slot.pma_index = TLB_INVALID_PMA_INDEX;
+            write_tlb(set_index, slot_index, TLB_INVALID_PAGE, host_addr{}, TLB_INVALID_PMA_INDEX);
         }
     }
 }
 
 void machine::init_tlb(const shadow_tlb_state &shadow_tlb) {
-    const char *err_prefix = "stored TLB is corrupted: ";
-    for (auto use : {TLB_CODE, TLB_READ, TLB_WRITE}) {
-        auto &hot_set = m_s.tlb.hot[use];
-        auto &cold_set = m_s.tlb.cold[use];
-        auto &shadow_set = shadow_tlb[use];
+    for (auto set_index : {TLB_CODE, TLB_READ, TLB_WRITE}) {
         for (uint64_t slot_index = 0; slot_index < TLB_SET_SIZE; ++slot_index) {
-            // copy from shadow to live TLB
-            auto &shadow_slot = shadow_set[slot_index];
-            auto &cold_slot = cold_set[slot_index];
-            const auto pma_index = cold_slot.pma_index = shadow_slot.pma_index;
-            auto &hot_slot = hot_set[slot_index];
-            const auto vaddr_page = hot_slot.vaddr_page = shadow_slot.vaddr_page;
-            // check consistency of slot, if valid, and compute live host address offset
-            if (shadow_slot.vaddr_page != TLB_INVALID_PAGE) {
-                // virtual page address must be page-aligned
-                if (shadow_slot.vaddr_page & PAGE_OFFSET_MASK) {
-                    throw std::invalid_argument{err_prefix + "invalid vaddr_page in TLB slot"s};
-                }
-                // PMA index cannot be outside pmas array
-                if (pma_index >= m_s.pmas.size()) {
-                    throw std::invalid_argument{err_prefix + "invalid pma_index in active TLB slot"s};
-                }
-                // PMA at index must be a non-empty memory PMA
-                const auto &pma = m_s.pmas[pma_index];
-                if (pma.get_length() == 0 || !pma.get_istart_M()) {
-                    throw std::invalid_argument{err_prefix + "invalid pma_index in active TLB slot"s};
-                }
-                auto paddr_page = shadow_slot.vaddr_page + shadow_slot.vp_offset;
-                // translated physical page address must be page-aligned
-                if (paddr_page & PAGE_OFFSET_MASK) {
-                    throw std::invalid_argument{err_prefix + "invalid vp_offset in active TLB slot"s};
-                }
-                // translated physical page address must fall entirely into designated PMA
-                if (paddr_page < pma.get_start() || paddr_page - pma.get_start() > pma.get_length() - PMA_PAGE_SIZE) {
-                    throw std::invalid_argument{err_prefix + "invalid vp_offset in active TLB slot"s};
-                }
-                hot_slot.vh_offset = get_host_addr(paddr_page, pma_index) - vaddr_page;
-            } else {
-                if (shadow_slot.vp_offset != 0) {
-                    throw std::invalid_argument{err_prefix + "invalid vp_offset in empty TLB slot"s};
-                }
-                if (pma_index != TLB_INVALID_PMA_INDEX) {
-                    throw std::invalid_argument{err_prefix + "invalid pma_index in empty TLB slot"s};
-                }
-                // We never leave garbage behind, even in invalid slots
-                hot_slot.vh_offset = host_addr{};
-            }
+            const auto vaddr_page = shadow_tlb[set_index][slot_index].vaddr_page;
+            const auto vp_offset = shadow_tlb[set_index][slot_index].vp_offset;
+            const auto pma_index = shadow_tlb[set_index][slot_index].pma_index;
+            check_shadow_tlb(set_index, slot_index, vaddr_page, vp_offset, pma_index, "stored TLB is corrupt: "s);
+            write_shadow_tlb(set_index, slot_index, vaddr_page, vp_offset, pma_index);
         }
     }
 }
 
-machine::machine(const machine_config &c, const machine_runtime_config &r) : m_c{c}, m_uarch{c.uarch}, m_r{r} {
+void machine::init_uarch(const uarch_config &uc) {
+    using reg = machine_reg;
+    write_reg(reg::uarch_pc, uc.processor.pc);
+    write_reg(reg::uarch_cycle, uc.processor.cycle);
+    write_reg(reg::uarch_halt_flag, uc.processor.halt_flag);
+    // General purpose registers
+    for (int i = 1; i < UARCH_X_REG_COUNT; i++) {
+        write_reg(machine_reg_enum(reg::uarch_x0, i), uc.processor.x[i]);
+    }
+    // Register shadow state
+    m_us.shadow_state = make_shadow_uarch_state_pma_entry(PMA_SHADOW_UARCH_STATE_START, PMA_SHADOW_UARCH_STATE_LENGTH);
+    // Register RAM
+    constexpr auto ram_description = "uarch RAM";
+    if (!uc.ram.image_filename.empty()) {
+        // Load RAM image from file
+        m_us.ram =
+            make_callocd_memory_pma_entry(ram_description, PMA_UARCH_RAM_START, UARCH_RAM_LENGTH, uc.ram.image_filename)
+                .set_flags(ram_flags);
+    } else {
+        // Load embedded pristine RAM image
+        m_us.ram = make_callocd_memory_pma_entry(ram_description, PMA_UARCH_RAM_START, PMA_UARCH_RAM_LENGTH)
+                       .set_flags(ram_flags);
+        if (uarch_pristine_ram_len > m_us.ram.get_length()) {
+            throw std::runtime_error("embedded uarch RAM image does not fit in uarch ram PMA");
+        }
+        memcpy(m_us.ram.get_memory().get_host_memory(), uarch_pristine_ram, uarch_pristine_ram_len);
+    }
+}
+
+machine::machine(const machine_config &c, const machine_runtime_config &r) : m_c{c}, m_r{r} {
 
     if (m_c.processor.marchid == UINT64_C(-1)) {
         m_c.processor.marchid = MARCHID_INIT;
@@ -522,10 +517,13 @@ machine::machine(const machine_config &c, const machine_runtime_config &r) : m_c
     for (auto &pma : m_s.pmas) {
         m_merkle_pmas.push_back(&pma);
     }
+    m_merkle_pmas.push_back(&m_us.shadow_state);
+    m_merkle_pmas.push_back(&m_us.ram);
+    // Last, add sentinel PMA
+    m_merkle_pmas.push_back(&m_s.empty_pma);
 
     // Last, add empty sentinels until we reach capacity (need at least one sentinel)
     register_pma_entry(make_empty_pma_entry("sentinel"s, 0, 0));
-
     // NOLINTNEXTLINE(readability-static-accessed-through-instance)
     if (m_s.pmas.capacity() != PMA_MAX) {
         throw std::logic_error{"PMAs array must be able to hold PMA_MAX entries"};
@@ -536,12 +534,6 @@ machine::machine(const machine_config &c, const machine_runtime_config &r) : m_c
 
     // Populate shadow PMAs
     populate_shadow_pmas_state(m_s.pmas, shadow_pmas);
-
-    // Include uarch PMAs in set considered by Merkle tree
-    m_merkle_pmas.push_back(&m_uarch.get_state().shadow_state);
-    m_merkle_pmas.push_back(&m_uarch.get_state().ram);
-    // Last, add sentinel PMA
-    m_merkle_pmas.push_back(&m_s.empty_pma);
 
     // Initialize TLB device.
     // This must be done after all PMA entries are already registered, so we can lookup page addresses
@@ -732,7 +724,7 @@ machine_config machine::get_serialization_config() const {
     c.cmio.rx_buffer.image_filename.clear();
     c.cmio.tx_buffer.image_filename.clear();
     c.uarch.processor.cycle = read_reg(reg::uarch_cycle);
-    c.uarch.processor.halt_flag = (read_reg(reg::uarch_halt_flag) != 0);
+    c.uarch.processor.halt_flag = read_reg(reg::uarch_halt_flag);
     c.uarch.processor.pc = read_reg(reg::uarch_pc);
     for (int i = 1; i < UARCH_X_REG_COUNT; i++) {
         c.uarch.processor.x[i] = read_reg(machine_reg_enum(reg::uarch_x0, i));
@@ -751,7 +743,7 @@ static void store_device_pma(const machine &m, const pma_entry &pma, const std::
          page_start_in_range += PMA_PAGE_SIZE) {
         const unsigned char *page_data = nullptr;
         auto peek = pma.get_peek();
-        if (!peek(pma, m, page_start_in_range, &page_data, scratch.get())) {
+        if (!peek(pma, m, page_start_in_range, PMA_PAGE_SIZE, &page_data, scratch.get())) {
             throw std::runtime_error{"peek failed"};
         }
         if (page_data == nullptr) {
@@ -799,10 +791,85 @@ host_addr machine::get_host_addr(uint64_t paddr, uint64_t pma_index) const {
     return host_addr{paddr} - get_hp_offset(pma_index);
 }
 
-void machine::mark_dirty_page(host_addr haddr, uint64_t pma_index) {
-    auto paddr = get_paddr(haddr, pma_index);
+void machine::mark_dirty_page(uint64_t paddr, uint64_t pma_index) {
     auto &pma = m_s.pmas[static_cast<int>(pma_index)];
     pma.mark_dirty_page(paddr - pma.get_start());
+}
+
+void machine::mark_dirty_page(host_addr haddr, uint64_t pma_index) {
+    auto paddr = get_paddr(haddr, pma_index);
+    mark_dirty_page(paddr, pma_index);
+}
+
+uint64_t machine::read_shadow_tlb(TLB_set_index set_index, uint64_t slot_index, shadow_tlb_what reg) const {
+    switch (reg) {
+        case shadow_tlb_what::vaddr_page:
+            return m_s.tlb.hot[set_index][slot_index].vaddr_page;
+        case shadow_tlb_what::vp_offset: {
+            const auto vaddr_page = m_s.tlb.hot[set_index][slot_index].vaddr_page;
+            if (vaddr_page != TLB_INVALID_PAGE) {
+                const auto vh_offset = m_s.tlb.hot[set_index][slot_index].vh_offset;
+                const auto haddr_page = vaddr_page + vh_offset;
+                const auto pma_index = m_s.tlb.cold[set_index][slot_index].pma_index;
+                return get_paddr(haddr_page, pma_index) - vaddr_page;
+            }
+            return 0;
+        }
+        case shadow_tlb_what::pma_index:
+            return m_s.tlb.cold[set_index][slot_index].pma_index;
+        default:
+            throw std::domain_error{"unknown shadow TLB register"};
+    }
+}
+
+void machine::check_shadow_tlb(TLB_set_index set_index, uint64_t slot_index, uint64_t vaddr_page, uint64_t vp_offset,
+    uint64_t pma_index, const std::string &prefix) const {
+    if (set_index >= TLB_LAST_) {
+        throw std::domain_error{prefix + "TLB set index is out of range"s};
+    }
+    if (slot_index >= TLB_SET_SIZE) {
+        throw std::domain_error{prefix + "TLB slot index is out of range"s};
+    }
+    if (vaddr_page != TLB_INVALID_PAGE) {
+        if (pma_index >= m_s.pmas.size()) {
+            throw std::domain_error{prefix + "pma_index is out of range"s};
+        }
+        const auto &pma = m_s.pmas[pma_index];
+        if (pma.get_length() == 0 || !pma.get_istart_M()) {
+            throw std::invalid_argument{prefix + "pma_index does not point to memory range"s};
+        }
+        if ((vaddr_page & PAGE_OFFSET_MASK) != 0) {
+            throw std::invalid_argument{prefix + "vaddr_page is not aligned"s};
+        }
+        const auto paddr_page = vaddr_page + vp_offset;
+        if ((paddr_page & PAGE_OFFSET_MASK) != 0) {
+            throw std::invalid_argument{prefix + "vp_offset is not aligned"s};
+        }
+        const auto pma_end = pma.get_start() + (pma.get_length() - PMA_PAGE_SIZE);
+        if (paddr_page < pma.get_start() || paddr_page >= pma_end) {
+            throw std::invalid_argument{prefix + "vp_offset is inconsistent with pma_index"s};
+        }
+    } else if (pma_index != TLB_INVALID_PMA_INDEX || vp_offset != 0) {
+        throw std::domain_error{prefix + "inconsistent empty TLB slot"};
+    }
+}
+
+void machine::write_tlb(TLB_set_index set_index, uint64_t slot_index, uint64_t vaddr_page, host_addr vh_offset,
+    uint64_t pma_index) {
+    m_s.tlb.hot[set_index][slot_index].vaddr_page = vaddr_page;
+    m_s.tlb.hot[set_index][slot_index].vh_offset = vh_offset;
+    m_s.tlb.cold[set_index][slot_index].pma_index = pma_index;
+}
+
+void machine::write_shadow_tlb(TLB_set_index set_index, uint64_t slot_index, uint64_t vaddr_page, uint64_t vp_offset,
+    uint64_t pma_index) {
+    if (vaddr_page != TLB_INVALID_PAGE) {
+        auto paddr_page = vaddr_page + vp_offset;
+        const auto vh_offset = get_host_addr(paddr_page, pma_index) - vaddr_page;
+        write_tlb(set_index, slot_index, vaddr_page, vh_offset, pma_index);
+    } else {
+        write_tlb(set_index, slot_index, TLB_INVALID_PAGE, host_addr{0}, TLB_INVALID_PMA_INDEX);
+    }
 }
 
 host_addr machine::get_hp_offset(uint64_t pma_index) const {
@@ -861,8 +928,8 @@ void machine::store_pmas(const machine_config &c, const std::string &dir) const 
     }
     store_memory_pma(find_pma_entry<uint64_t>(PMA_CMIO_RX_BUFFER_START), dir);
     store_memory_pma(find_pma_entry<uint64_t>(PMA_CMIO_TX_BUFFER_START), dir);
-    if (!m_uarch.get_state().ram.get_istart_E()) {
-        store_memory_pma(m_uarch.get_state().ram, dir);
+    if (!m_us.ram.get_istart_E()) {
+        store_memory_pma(m_us.ram, dir);
     }
 }
 
@@ -1159,75 +1226,75 @@ uint64_t machine::read_reg(reg r) const {
         case reg::htif_iyield:
             return m_s.htif.iyield;
         case reg::uarch_x0:
-            return m_uarch.get_state().x[0];
+            return m_us.x[0];
         case reg::uarch_x1:
-            return m_uarch.get_state().x[1];
+            return m_us.x[1];
         case reg::uarch_x2:
-            return m_uarch.get_state().x[2];
+            return m_us.x[2];
         case reg::uarch_x3:
-            return m_uarch.get_state().x[3];
+            return m_us.x[3];
         case reg::uarch_x4:
-            return m_uarch.get_state().x[4];
+            return m_us.x[4];
         case reg::uarch_x5:
-            return m_uarch.get_state().x[5];
+            return m_us.x[5];
         case reg::uarch_x6:
-            return m_uarch.get_state().x[6];
+            return m_us.x[6];
         case reg::uarch_x7:
-            return m_uarch.get_state().x[7];
+            return m_us.x[7];
         case reg::uarch_x8:
-            return m_uarch.get_state().x[8];
+            return m_us.x[8];
         case reg::uarch_x9:
-            return m_uarch.get_state().x[9];
+            return m_us.x[9];
         case reg::uarch_x10:
-            return m_uarch.get_state().x[10];
+            return m_us.x[10];
         case reg::uarch_x11:
-            return m_uarch.get_state().x[11];
+            return m_us.x[11];
         case reg::uarch_x12:
-            return m_uarch.get_state().x[12];
+            return m_us.x[12];
         case reg::uarch_x13:
-            return m_uarch.get_state().x[13];
+            return m_us.x[13];
         case reg::uarch_x14:
-            return m_uarch.get_state().x[14];
+            return m_us.x[14];
         case reg::uarch_x15:
-            return m_uarch.get_state().x[15];
+            return m_us.x[15];
         case reg::uarch_x16:
-            return m_uarch.get_state().x[16];
+            return m_us.x[16];
         case reg::uarch_x17:
-            return m_uarch.get_state().x[17];
+            return m_us.x[17];
         case reg::uarch_x18:
-            return m_uarch.get_state().x[18];
+            return m_us.x[18];
         case reg::uarch_x19:
-            return m_uarch.get_state().x[19];
+            return m_us.x[19];
         case reg::uarch_x20:
-            return m_uarch.get_state().x[20];
+            return m_us.x[20];
         case reg::uarch_x21:
-            return m_uarch.get_state().x[21];
+            return m_us.x[21];
         case reg::uarch_x22:
-            return m_uarch.get_state().x[22];
+            return m_us.x[22];
         case reg::uarch_x23:
-            return m_uarch.get_state().x[23];
+            return m_us.x[23];
         case reg::uarch_x24:
-            return m_uarch.get_state().x[24];
+            return m_us.x[24];
         case reg::uarch_x25:
-            return m_uarch.get_state().x[25];
+            return m_us.x[25];
         case reg::uarch_x26:
-            return m_uarch.get_state().x[26];
+            return m_us.x[26];
         case reg::uarch_x27:
-            return m_uarch.get_state().x[27];
+            return m_us.x[27];
         case reg::uarch_x28:
-            return m_uarch.get_state().x[28];
+            return m_us.x[28];
         case reg::uarch_x29:
-            return m_uarch.get_state().x[29];
+            return m_us.x[29];
         case reg::uarch_x30:
-            return m_uarch.get_state().x[30];
+            return m_us.x[30];
         case reg::uarch_x31:
-            return m_uarch.get_state().x[31];
+            return m_us.x[31];
         case reg::uarch_pc:
-            return m_uarch.get_state().pc;
+            return m_us.pc;
         case reg::uarch_cycle:
-            return m_uarch.get_state().cycle;
+            return m_us.cycle;
         case reg::uarch_halt_flag:
-            return static_cast<uint64_t>(m_uarch.get_state().halt_flag);
+            return static_cast<uint64_t>(m_us.halt_flag);
         case reg::htif_tohost_dev:
             return HTIF_DEV_FIELD(m_s.htif.tohost);
         case reg::htif_tohost_cmd:
@@ -1569,106 +1636,106 @@ void machine::write_reg(reg w, uint64_t value) {
         case reg::uarch_x0:
             throw std::invalid_argument{"register is read-only"};
         case reg::uarch_x1:
-            m_uarch.get_state().x[1] = value;
+            m_us.x[1] = value;
             break;
         case reg::uarch_x2:
-            m_uarch.get_state().x[2] = value;
+            m_us.x[2] = value;
             break;
         case reg::uarch_x3:
-            m_uarch.get_state().x[3] = value;
+            m_us.x[3] = value;
             break;
         case reg::uarch_x4:
-            m_uarch.get_state().x[4] = value;
+            m_us.x[4] = value;
             break;
         case reg::uarch_x5:
-            m_uarch.get_state().x[5] = value;
+            m_us.x[5] = value;
             break;
         case reg::uarch_x6:
-            m_uarch.get_state().x[6] = value;
+            m_us.x[6] = value;
             break;
         case reg::uarch_x7:
-            m_uarch.get_state().x[7] = value;
+            m_us.x[7] = value;
             break;
         case reg::uarch_x8:
-            m_uarch.get_state().x[8] = value;
+            m_us.x[8] = value;
             break;
         case reg::uarch_x9:
-            m_uarch.get_state().x[9] = value;
+            m_us.x[9] = value;
             break;
         case reg::uarch_x10:
-            m_uarch.get_state().x[10] = value;
+            m_us.x[10] = value;
             break;
         case reg::uarch_x11:
-            m_uarch.get_state().x[11] = value;
+            m_us.x[11] = value;
             break;
         case reg::uarch_x12:
-            m_uarch.get_state().x[12] = value;
+            m_us.x[12] = value;
             break;
         case reg::uarch_x13:
-            m_uarch.get_state().x[13] = value;
+            m_us.x[13] = value;
             break;
         case reg::uarch_x14:
-            m_uarch.get_state().x[14] = value;
+            m_us.x[14] = value;
             break;
         case reg::uarch_x15:
-            m_uarch.get_state().x[15] = value;
+            m_us.x[15] = value;
             break;
         case reg::uarch_x16:
-            m_uarch.get_state().x[16] = value;
+            m_us.x[16] = value;
             break;
         case reg::uarch_x17:
-            m_uarch.get_state().x[17] = value;
+            m_us.x[17] = value;
             break;
         case reg::uarch_x18:
-            m_uarch.get_state().x[18] = value;
+            m_us.x[18] = value;
             break;
         case reg::uarch_x19:
-            m_uarch.get_state().x[19] = value;
+            m_us.x[19] = value;
             break;
         case reg::uarch_x20:
-            m_uarch.get_state().x[20] = value;
+            m_us.x[20] = value;
             break;
         case reg::uarch_x21:
-            m_uarch.get_state().x[21] = value;
+            m_us.x[21] = value;
             break;
         case reg::uarch_x22:
-            m_uarch.get_state().x[22] = value;
+            m_us.x[22] = value;
             break;
         case reg::uarch_x23:
-            m_uarch.get_state().x[23] = value;
+            m_us.x[23] = value;
             break;
         case reg::uarch_x24:
-            m_uarch.get_state().x[24] = value;
+            m_us.x[24] = value;
             break;
         case reg::uarch_x25:
-            m_uarch.get_state().x[25] = value;
+            m_us.x[25] = value;
             break;
         case reg::uarch_x26:
-            m_uarch.get_state().x[26] = value;
+            m_us.x[26] = value;
             break;
         case reg::uarch_x27:
-            m_uarch.get_state().x[27] = value;
+            m_us.x[27] = value;
             break;
         case reg::uarch_x28:
-            m_uarch.get_state().x[28] = value;
+            m_us.x[28] = value;
             break;
         case reg::uarch_x29:
-            m_uarch.get_state().x[29] = value;
+            m_us.x[29] = value;
             break;
         case reg::uarch_x30:
-            m_uarch.get_state().x[30] = value;
+            m_us.x[30] = value;
             break;
         case reg::uarch_x31:
-            m_uarch.get_state().x[31] = value;
+            m_us.x[31] = value;
             break;
         case reg::uarch_pc:
-            m_uarch.get_state().pc = value;
+            m_us.pc = value;
             break;
         case reg::uarch_cycle:
-            m_uarch.get_state().cycle = value;
+            m_us.cycle = value;
             break;
         case reg::uarch_halt_flag:
-            m_uarch.get_state().halt_flag = static_cast<bool>(value);
+            m_us.halt_flag = static_cast<bool>(value);
             break;
         case reg::htif_tohost_dev:
             m_s.htif.tohost = HTIF_REPLACE_DEV(m_s.htif.tohost, value);
@@ -1751,7 +1818,7 @@ bool machine::verify_dirty_page_maps() const {
             const uint64_t page_address = pma.get_start() + page_start_in_range;
             if (pma.get_istart_M()) {
                 const unsigned char *page_data = nullptr;
-                peek(pma, *this, page_start_in_range, &page_data, scratch.get());
+                peek(pma, *this, page_start_in_range, PMA_PAGE_SIZE, &page_data, scratch.get());
                 hash_type stored;
                 hash_type real;
                 m_t.get_page_node_hash(page_address, stored);
@@ -1817,7 +1884,7 @@ bool machine::update_merkle_tree() const {
                 }
                 // If the peek failed, or if it returned a page for update but
                 // we failed updating it, the entire process failed
-                if (!peek(*pma, *this, page_start_in_range, &page_data, scratch.get())) {
+                if (!peek(*pma, *this, page_start_in_range, PMA_PAGE_SIZE, &page_data, scratch.get())) {
                     return false;
                 }
                 if (page_data != nullptr) {
@@ -1875,7 +1942,7 @@ bool machine::update_merkle_tree_page(uint64_t address) {
     m_t.begin_update();
     const unsigned char *page_data = nullptr;
     auto peek = pma.get_peek();
-    if (!peek(pma, *this, page_start_in_range, &page_data, scratch.get())) {
+    if (!peek(pma, *this, page_start_in_range, PMA_PAGE_SIZE, &page_data, scratch.get())) {
         m_t.end_update(h);
         return false;
     }
@@ -1955,7 +2022,7 @@ machine_merkle_tree::proof_type machine::get_proof(uint64_t address, int log2_si
         if (!pma.get_istart_E()) {
             const uint64_t page_start_in_range = (address - pma.get_start()) & (~(PMA_PAGE_SIZE - 1));
             auto peek = pma.get_peek();
-            if (!peek(pma, *this, page_start_in_range, &page_data, scratch.get())) {
+            if (!peek(pma, *this, page_start_in_range, PMA_PAGE_SIZE, &page_data, scratch.get())) {
                 throw std::runtime_error{"PMA peek failed"};
             }
         }
@@ -1973,70 +2040,91 @@ machine_merkle_tree::proof_type machine::get_proof(uint64_t address, int log2_si
     return get_proof(address, log2_size, skip_merkle_tree_update);
 }
 
-void machine::read_memory(uint64_t address, unsigned char *data, uint64_t length) const {
+void machine::read_memory(uint64_t paddr, unsigned char *data, uint64_t length) const {
     if (length == 0) {
         return;
     }
     if (data == nullptr) {
         throw std::invalid_argument{"invalid data buffer"};
     }
-    const pma_entry &pma = find_pma_entry(m_merkle_pmas, address, length);
-    if (pma.get_istart_M()) {
-        memcpy(data, pma.get_memory().get_host_memory() + (address - pma.get_start()), length);
-        return;
-    }
-    auto scratch = unique_calloc<unsigned char>(PMA_PAGE_SIZE);
-    // relative request address inside pma
-    uint64_t shift = address - pma.get_start();
-    // relative page address inside pma
-    constexpr const auto log2_page_size = PMA_constants::PMA_PAGE_SIZE_LOG2;
-    uint64_t page_address = (shift >> log2_page_size) << log2_page_size;
-    // relative request address inside page
-    shift -= page_address;
-
-    const unsigned char *page_data = nullptr;
-    auto peek = pma.get_peek();
-
-    while (length != 0) {
-        const uint64_t bytes_to_write = std::min(length, PMA_PAGE_SIZE - shift);
-        // avoid copying to the intermediate buffer when getting the whole page
-        if (bytes_to_write == PMA_PAGE_SIZE) {
-            if (!peek(pma, *this, page_address, &page_data, data)) {
+    // Compute the distance between the initial paddr and the first page boundary
+    uint64_t align_paddr = (paddr & PAGE_OFFSET_MASK) != 0 ? (paddr | PAGE_OFFSET_MASK) + 1 : paddr;
+    uint64_t align_length = align_paddr - paddr;
+    const uint64_t page_size = PMA_PAGE_SIZE;
+    align_length = (align_length == 0) ? page_size : align_length;
+    // First peek goes at most to the next page boundary, or up to length
+    uint64_t peek_length = std::min(align_length, length);
+    // The outer loop finds the PMA for all peeks performed by the inner loop
+    // The inner loop peeks at most min(page_size, length) from the PMA per iteration
+    // All peeks but the absolute first peek start at a page boundary.
+    // That first peek reads at most up to the next page boundary.
+    // So the inner loop iterations never cross page boundaries.
+    for (;;) {
+        const pma_entry &pma = find_pma_entry(m_merkle_pmas, paddr, peek_length);
+        auto peek = pma.get_peek();
+        const auto pma_start = pma.get_start();
+        const auto pma_empty = pma.get_istart_E();
+        const auto pma_length = pma.get_length();
+        // If the PMA is empty, the inner loop will break after a single iteration.
+        // But it is safe to return pristine data for that one iteration, without even peeking.
+        // This is because the inner iteration never reads past a page boundary, and the next
+        // non-empty PMA starts at the earliest on the next page boundary after paddr.
+        for (;;) {
+            const unsigned char *peek_data = nullptr;
+            // If non-empty PMA, peek, otherwise leave peek_data as nullptr (i.e. pristine)
+            if (!pma_empty && !peek(pma, *this, paddr - pma_start, peek_length, &peek_data, data)) {
                 throw std::runtime_error{"peek failed"};
             }
-            if (page_data == nullptr) {
-                memset(data, 0, bytes_to_write);
+            // If the chunk is pristine, copy zero data to buffer
+            if (peek_data == nullptr) {
+                memset(data, 0, peek_length);
+                // If peek returned pointer to internal buffer, copy to data buffer
+            } else if (peek_data != data) {
+                memcpy(data, peek_data, peek_length);
             }
-        } else {
-            if (!peek(pma, *this, page_address, &page_data, scratch.get())) {
-                throw std::runtime_error{"peek failed"};
+            // Otherwise, peek copied data straight into the data buffer
+            // If we read everything we wanted to read, we are done
+            length -= peek_length;
+            if (length == 0) {
+                return;
             }
-            if (page_data == nullptr) {
-                memset(data, 0, bytes_to_write);
-            } else {
-                memcpy(data, page_data + shift, bytes_to_write);
+            paddr += peek_length;
+            data += peek_length;
+            peek_length = std::min(page_size, length);
+            // If the PMA was empty, break to check if next read is in another PMA
+            if (pma_empty) {
+                break;
+            }
+            // If the next read does not fit in current PMA, break to get the next one
+            // There can be no overflow in the condition.
+            // Since the PMA is non-empty, (paddr-pma_start) >= 0.
+            // Moreover, pma_length >= page_size.
+            // Since, peek_length <= page_size, we get (pma_length-peek_length) >= 0.
+            if (paddr - pma_start >= pma_length - peek_length) {
+                break;
             }
         }
-
-        page_address += PMA_PAGE_SIZE;
-        length -= bytes_to_write;
-        data += bytes_to_write;
-        shift = 0;
     }
 }
 
-void machine::write_memory(uint64_t address, const unsigned char *data, uint64_t length) {
+void machine::write_memory(uint64_t paddr, const unsigned char *data, uint64_t length) {
     if (length == 0) {
         return;
     }
     if (data == nullptr) {
         throw std::invalid_argument{"invalid data buffer"};
     }
-    pma_entry &pma = find_pma_entry(m_merkle_pmas, address, length);
-    if (!pma.get_istart_M() || pma.get_istart_E()) {
-        throw std::invalid_argument{"address range not entirely in memory PMA"};
+    pma_entry &pma = find_pma_entry(m_merkle_pmas, paddr, length);
+    if (pma.get_istart_IO()) {
+        throw std::invalid_argument{"attempted write to device memory range"};
     }
-    pma.write_memory(address, data, length);
+    if (!pma.get_istart_M() || pma.get_istart_E()) {
+        throw std::invalid_argument{"address range not entirely in single memory range"};
+    }
+    if (DID_is_protected(pma.get_istart_DID())) {
+        throw std::invalid_argument{"attempt to write to protected memory range"};
+    }
+    pma.write_memory(paddr, data, length);
 }
 
 void machine::fill_memory(uint64_t address, uint8_t data, uint64_t length) {
@@ -2124,29 +2212,29 @@ uint64_t machine::translate_virtual_address(uint64_t vaddr) {
     return paddr;
 }
 
-uint64_t machine::read_word(uint64_t word_address) const {
+uint64_t machine::read_word(uint64_t paddr) const {
     // Make sure address is aligned
-    if ((word_address & (PMA_WORD_SIZE - 1)) != 0) {
+    if ((paddr & (sizeof(uint64_t) - 1)) != 0) {
         throw std::invalid_argument{"address not aligned"};
     }
-    const pma_entry &pma = find_pma_entry<uint64_t>(word_address);
-    // ??D We should split peek into peek_word and peek_page
-    // for performance. On the other hand, this function
-    // will almost never be used, so one wonders if it is worth it...
-    auto scratch = unique_calloc<unsigned char>(PMA_PAGE_SIZE);
-    const unsigned char *page_data = nullptr;
-    const uint64_t page_start_in_range = (word_address - pma.get_start()) & (~(PMA_PAGE_SIZE - 1));
+    // Find PMA where address falls
+    const pma_entry &pma = find_pma_entry<uint64_t>(paddr);
+    // If none was found, word must be pristine
+    if (pma.get_istart_E()) {
+        return 0;
+    }
+    // Otherwise, peek
+    unsigned char scratch[sizeof(uint64_t)];
     auto peek = pma.get_peek();
-    if (!peek(pma, *this, page_start_in_range, &page_data, scratch.get())) {
+    const auto offset = paddr - pma.get_start();
+    const unsigned char *peek_data = nullptr;
+    if (!peek(pma, *this, offset, sizeof(uint64_t), &peek_data, scratch)) {
         throw std::invalid_argument{"peek failed"};
     }
-    // If peek returns a page, read from it
-    if (page_data != nullptr) {
-        const uint64_t word_start_in_range = (word_address - pma.get_start()) & (PMA_PAGE_SIZE - 1);
-        return aliased_aligned_read<uint64_t>(page_data + word_start_in_range);
-        // Otherwise, page is always pristine
+    if (peek_data == nullptr) { // pristine word inside a PMA
+        return 0;
     }
-    return 0;
+    return aliased_aligned_read<uint64_t>(peek_data);
 }
 
 void machine::send_cmio_response(uint16_t reason, const unsigned char *data, uint64_t length) {
@@ -2192,18 +2280,28 @@ void machine::verify_send_cmio_response(uint16_t reason, const unsigned char *da
 }
 
 void machine::reset_uarch() {
-#if OKUARCH
-    uarch_state_access a(m_uarch.get_state(), get_state());
-    uarch_reset_state(a);
-#endif
+    using reg = machine_reg;
+    write_reg(reg::uarch_halt_flag, UARCH_HALT_FLAG_INIT);
+    write_reg(reg::uarch_pc, UARCH_PC_INIT);
+    write_reg(reg::uarch_cycle, UARCH_CYCLE_INIT);
+    // General purpose registers
+    for (int i = 1; i < UARCH_X_REG_COUNT; i++) {
+        write_reg(machine_reg_enum(reg::uarch_x0, i), UARCH_X_INIT);
+    }
+    // Load embedded pristine RAM image
+    if (uarch_pristine_ram_len > m_us.ram.get_length()) {
+        throw std::runtime_error("embedded uarch ram image does not fit in uarch ram pma");
+    }
+    // Reset RAM to initial state
+    m_us.ram.fill_memory(m_us.ram.get_start(), 0, m_us.ram.get_length());
+    m_us.ram.write_memory(m_us.ram.get_start(), uarch_pristine_ram, uarch_pristine_ram_len);
 }
 
 access_log machine::log_reset_uarch(const access_log::type &log_type) {
-#if OKUARCH
     hash_type root_hash_before;
     get_root_hash(root_hash_before);
     // Call uarch_reset_state with a uarch_record_state_access object
-    uarch_record_state_access a(m_uarch.get_state(), *this, log_type);
+    uarch_record_state_access a(m_us, *this, log_type);
     a.push_bracket(bracket_type::begin, "reset uarch state");
     uarch_reset_state(a);
     a.push_bracket(bracket_type::end, "reset uarch state");
@@ -2213,13 +2311,10 @@ access_log machine::log_reset_uarch(const access_log::type &log_type) {
     get_root_hash(root_hash_after);
     verify_reset_uarch(root_hash_before, *a.get_log(), root_hash_after);
     return std::move(*a.get_log());
-#endif
-    return access_log{log_type};
 }
 
 void machine::verify_reset_uarch(const hash_type &root_hash_before, const access_log &log,
     const hash_type &root_hash_after) {
-#if OKUARCH
     // There must be at least one access in log
     if (log.get_accesses().empty()) {
         throw std::invalid_argument{"too few accesses in log"};
@@ -2234,26 +2329,19 @@ void machine::verify_reset_uarch(const hash_type &root_hash_before, const access
     if (obtained_root_hash != root_hash_after) {
         throw std::invalid_argument{"mismatch in root hash after replay"};
     }
-#endif
-    (void) root_hash_before;
-    (void) log;
-    (void) root_hash_after;
 }
 
 // Declaration of explicit instantiation in module uarch-step.cpp
-#if OKUARCH
 extern template UArchStepStatus uarch_step(uarch_record_state_access &a);
-#endif
 
 access_log machine::log_step_uarch(const access_log::type &log_type) {
-#if OKUARCH
-    if (m_uarch.get_state().ram.get_istart_E()) {
+    if (m_us.ram.get_istart_E()) {
         throw std::runtime_error("microarchitecture RAM is not present");
     }
     hash_type root_hash_before;
     get_root_hash(root_hash_before);
     // Call interpret with a logged state access object
-    uarch_record_state_access a(m_uarch.get_state(), *this, log_type);
+    uarch_record_state_access a(m_us, *this, log_type);
     a.push_bracket(bracket_type::begin, "step");
     uarch_step(a);
     a.push_bracket(bracket_type::end, "step");
@@ -2262,18 +2350,13 @@ access_log machine::log_step_uarch(const access_log::type &log_type) {
     get_root_hash(root_hash_after);
     verify_step_uarch(root_hash_before, *a.get_log(), root_hash_after);
     return std::move(*a.get_log());
-#endif
-    return access_log{log_type};
 }
 
 // Declaration of explicit instantiation in module uarch-step.cpp
-#if OKUARCH
 extern template UArchStepStatus uarch_step(uarch_replay_state_access &a);
-#endif
 
 void machine::verify_step_uarch(const hash_type &root_hash_before, const access_log &log,
     const hash_type &root_hash_after) {
-#if OKUARCH
     // There must be at least one access in log
     if (log.get_accesses().empty()) {
         throw std::invalid_argument{"too few accesses in log"};
@@ -2288,10 +2371,6 @@ void machine::verify_step_uarch(const hash_type &root_hash_before, const access_
     if (obtained_root_hash != root_hash_after) {
         throw std::invalid_argument{"mismatch in root hash after replay"};
     }
-#endif
-    (void) root_hash_before;
-    (void) log;
-    (void) root_hash_after;
 }
 
 machine_config machine::get_default_config() {
@@ -2300,18 +2379,14 @@ machine_config machine::get_default_config() {
 
 // NOLINTNEXTLINE(readability-convert-member-functions-to-static)
 uarch_interpreter_break_reason machine::run_uarch(uint64_t uarch_cycle_end) {
-#if OKUARCH
     if (read_reg(reg::iunrep) != 0) {
         throw std::runtime_error("microarchitecture cannot be used with unreproducible machines");
     }
-    if (m_uarch.get_state().ram.get_istart_E()) {
+    if (m_us.ram.get_istart_E()) {
         throw std::runtime_error("microarchitecture RAM is not present");
     }
-    uarch_state_access a(m_uarch.get_state(), get_state());
+    uarch_state_access a(*this);
     return uarch_interpret(a, uarch_cycle_end);
-#endif
-    (void) uarch_cycle_end;
-    return uarch_interpreter_break_reason::uarch_halted;
 }
 
 interpreter_break_reason machine::log_step(uint64_t mcycle_count, const std::string &filename) {

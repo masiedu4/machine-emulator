@@ -302,8 +302,7 @@ public:
     /// \brief Adds a new access to the log
     /// \tparam A Type of access
     /// \param a Access object
-    /// \param text Annotation contents (added if the log
-    /// type includes annotations, ignored otherwise)
+    /// \param text Annotation contents (added if the log type includes annotations, ignored otherwise)
     template <typename A>
     void push_access(A &&a, const char *text) {
         m_accesses.push_back(std::forward<A>(a));

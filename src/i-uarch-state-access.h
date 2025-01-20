@@ -20,7 +20,7 @@
 #include <cstdint>
 
 #include "bracket-note.h"
-#include "pma.h"
+#include "tlb.h"
 
 namespace cartesi {
 
@@ -75,12 +75,8 @@ public:
         return derived().do_read_halt_flag();
     }
 
-    auto set_halt_flag() {
-        return derived().do_set_halt_flag();
-    }
-
-    auto reset_halt_flag() {
-        return derived().do_reset_halt_flag();
+    auto write_halt_flag(uint64_t v) {
+        return derived().do_write_halt_flag(v);
     }
 
     auto write_cycle(uint64_t v) {
@@ -98,6 +94,19 @@ public:
     /// \brief Resets uarch to pristine state
     void reset_state() {
         return derived().do_reset_state();
+    }
+
+    void putchar(uint8_t c) {
+        derived().do_putchar(c);
+    }
+
+    void mark_dirty_page(uint64_t paddr, uint64_t pma_index) {
+        return derived().do_mark_dirty_page(paddr, pma_index);
+    }
+
+    void write_tlb(TLB_set_index set_index, uint64_t slot_index, uint64_t vaddr_page, uint64_t vp_offset,
+        uint64_t pma_index) {
+        return derived().do_write_tlb(set_index, slot_index, vaddr_page, vp_offset, pma_index);
     }
 };
 

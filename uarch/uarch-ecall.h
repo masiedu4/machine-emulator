@@ -14,25 +14,23 @@
 // with this program (see COPYING). If not, see <https://www.gnu.org/licenses/>.
 //
 
+#ifndef UARCH_ECALL_H
+#define UARCH_ECALL_H
+
+#ifdef __cplusplus
 #include <cstdint>
+extern "C" {
+#else
+#include <stdint.h>
+#endif
 
-#include "htif-factory.h"
-#include "htif.h"
-#include "pma-constants.h"
-#include "pma.h"
+void ua_halt_ECALL();
+void ua_putchar_ECALL(uint8_t c);
+void ua_mark_dirty_page_ECALL(uint64_t paddr, uint64_t pma_index);
+void ua_write_tlb_ECALL(uint64_t use, uint64_t slot_index, uint64_t vaddr_page, uint64_t vp_offset, uint64_t pma_index);
 
-namespace cartesi {
-
-pma_entry make_htif_pma_entry(uint64_t start, uint64_t length) {
-    const pma_entry::flags f{
-        true,                // R
-        true,                // W
-        false,               // X
-        false,               // IR
-        false,               // IW
-        PMA_ISTART_DID::HTIF // DID
-    };
-    return make_device_pma_entry("HTIF device", start, length, pma_peek_pristine, &htif_driver).set_flags(f);
+#ifdef __cplusplus
 }
+#endif
 
-} // namespace cartesi
+#endif
